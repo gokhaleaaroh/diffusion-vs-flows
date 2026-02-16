@@ -14,9 +14,9 @@ import scipy
 
 # Configuration
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 256 # Reduced batch size for stability
-IMG_SIZE = 128 # Reduced resolution for faster training in this demo context
-EPOCHS = 50 # Small number of epochs for demonstration
+BATCH_SIZE = 256 # Increased for A100
+IMG_SIZE = 64 # Keep reasonable resolution
+EPOCHS = 100 # Increased for better convergence
 LR = 1e-3
 
 # Setup directories
@@ -195,23 +195,104 @@ class Diffusion:
 # -----------------------------------------------------------------------------
 # 3. Normalizing Flow Model (RealNVP)
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 3. Normalizing Flow Model (RealNVP - Advanced)
+# -----------------------------------------------------------------------------
+
+class ActNorm(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        self.logs = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, channels, 1, 1))
+        self.initialized = False
+
+    def forward(self, x, forward=True):
+        if not self.initialized:
+            # Data-dependent initialization
+            with torch.no_grad():
+                flatten = x.permute(1, 0, 2, 3).contiguous().view(x.shape[1], -1)
+                mean = flatten.mean(1).view(1, self.channels, 1, 1)
+                std = flatten.std(1).view(1, self.channels, 1, 1)
+                
+                self.logs.data = -torch.log(std + 1e-6)
+                self.bias.data = -mean * torch.exp(self.logs.data)
+                self.initialized = True
+
+        if forward:
+            z = x * torch.exp(self.logs) + self.bias
+            log_det = torch.sum(self.logs) * x.shape[2] * x.shape[3]
+            return z, log_det
+        else:
+            z = (x - self.bias) * torch.exp(-self.logs)
+            return z
+
+class Invertible1x1Conv(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        w_shape = [channels, channels]
+        w_init = np.linalg.qr(np.random.randn(*w_shape))[0].astype(np.float32)
+        self.weight = nn.Parameter(torch.from_numpy(w_init))
+        
+    def forward(self, x, forward=True):
+        b, c, h, w = x.shape
+        if forward:
+            # W * x
+            w_det = torch.det(self.weight)
+            log_det = torch.log(torch.abs(w_det) + 1e-6) * h * w
+            
+            w_view = self.weight.view(self.channels, self.channels, 1, 1)
+            z = F.conv2d(x, w_view)
+            return z, log_det
+        else:
+            w_inv = torch.inverse(self.weight)
+            w_view_inv = w_inv.view(self.channels, self.channels, 1, 1)
+            z = F.conv2d(x, w_view_inv)
+            return z
+
+class ResNetBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        if mid_channels is None:
+            mid_channels = out_channels
+        
+        self.norm1 = nn.BatchNorm2d(in_channels)
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, 3, padding=1)
+        self.norm2 = nn.BatchNorm2d(mid_channels)
+        self.conv2 = nn.Conv2d(mid_channels, out_channels, 1)
+        self.activation = nn.ReLU(inplace=True)
+        
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, 1)
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x):
+        h = self.activation(self.norm1(x))
+        h = self.activation(self.norm2(self.conv1(h)))
+        h = self.conv2(h)
+        return h + self.shortcut(x)
+
 class FlowCouplingLayer(nn.Module):
-    def __init__(self, in_channels, mid_channels=128):
+    def __init__(self, in_channels, mid_channels=64, num_blocks=2):
         super().__init__()
         self.in_channels = in_channels
-        # Logic to match torch.chunk(2, dim=1) behavior
-        # chunk(2) on 3 channels -> split sizes (2, 1)
-        self.ch1 = (in_channels + 1) // 2
+        self.ch1 = in_channels // 2
         self.ch2 = in_channels - self.ch1
         
-        # Scale and translation networks
-        self.st_net = nn.Sequential(
-            nn.Conv2d(self.ch1, mid_channels, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(mid_channels, mid_channels, 1),
-            nn.ReLU(),
-            nn.Conv2d(mid_channels, self.ch2 * 2, 3, padding=1)
-        )
+        layers = [nn.Conv2d(self.ch1, mid_channels, 3, padding=1)]
+        for _ in range(num_blocks):
+            layers.append(ResNetBlock(mid_channels, mid_channels))
+        layers.append(nn.BatchNorm2d(mid_channels))
+        layers.append(nn.ReLU(inplace=True))
+        layers.append(nn.Conv2d(mid_channels, self.ch2 * 2, 3, padding=1, bias=True))
+        
+        # Initialize last conv to zeros for identity start
+        layers[-1].weight.data.zero_()
+        layers[-1].bias.data.zero_()
+        
+        self.st_net = nn.Sequential(*layers)
     
     def forward(self, x, forward=True):
         x1, x2 = x.chunk(2, dim=1)
@@ -220,14 +301,12 @@ class FlowCouplingLayer(nn.Module):
         s = torch.tanh(s)
         
         if forward:
-            # Forward: x -> z (Normalizing)
             z1 = x1
             z2 = x2 * torch.exp(s) + t
             z = torch.cat([z1, z2], dim=1)
             log_det = torch.sum(s.view(s.size(0), -1), dim=1)
             return z, log_det
         else:
-            # Inverse: z -> x (Generative)
             z1 = x1
             z2 = x2
             x1 = z1
@@ -235,44 +314,138 @@ class FlowCouplingLayer(nn.Module):
             x = torch.cat([x1, x2], dim=1)
             return x
 
+class Squeeze(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+    def forward(self, x, forward=True):
+        b, c, h, w = x.shape
+        if forward:
+            # (b, c, h, w) -> (b, 4c, h/2, w/2)
+            x = x.view(b, c, h // 2, 2, w // 2, 2)
+            x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
+            x = x.view(b, c * 4, h // 2, w // 2)
+            return x, 0
+        else:
+            # (b, 4c, h/2, w/2) -> (b, c, h, w)
+            x = x.view(b, c // 4, 2, 2, h, w)
+            x = x.permute(0, 1, 4, 3, 5, 2).contiguous()
+            x = x.view(b, c // 4, h * 2, w * 2)
+            return x
+
 class RealNVP(nn.Module):
-    def __init__(self, num_scales=3, in_channels=3):
+    def __init__(self, in_channels=3, num_scales=3, num_layers_per_scale=4):
         super().__init__()
         self.layers = nn.ModuleList()
-        # Squeeze logic is implicit or we just treat channels. 
-        # For simplicity on low res, we just use channel coupling.
-        # We need to permute channels between layers to mix information.
+        self.num_scales = num_scales
         current_channels = in_channels
-        self.num_layers = 6
         
-        for i in range(self.num_layers):
-            self.layers.append(FlowCouplingLayer(current_channels))
+        self.scale_transforms = nn.ModuleList()
+        
+        for scale in range(num_scales):
+            # Squeeze
+            self.layers.append(Squeeze())
+            current_channels *= 4
             
-    def forward(self, x):
-        # x -> z
-        log_det_sum = 0
-        z = x
-        for i, layer in enumerate(self.layers):
-            z, log_det = layer(z, forward=True)
-            log_det_sum += log_det
-            # Permute channels (simple flip)
-            z = z.flip(1) 
-        return z, log_det_sum
+            # Flow Steps
+            steps = nn.ModuleList()
+            for _ in range(num_layers_per_scale):
+                steps.append(ActNorm(current_channels))
+                steps.append(Invertible1x1Conv(current_channels))
+                steps.append(FlowCouplingLayer(current_channels))
+            self.scale_transforms.append(steps)
+            
+            # If not last scale, factor out half channels
+            if scale < num_scales - 1:
+                current_channels //= 2
+                
+        self.final_channels = current_channels
 
-    def inverse(self, z):
-        # z -> x
-        x = z
-        for i, layer in enumerate(reversed(self.layers)):
-            x = x.flip(1) # Undo permutation first
-            x = layer(x, forward=False)
-        return x
+    def forward(self, x):
+        z = x
+        log_det_sum = 0
+        zs = []
+        
+        for scale in range(self.num_scales):
+            # Squeeze
+            z, _ = self.layers[scale](z, forward=True)
+            
+            # Flow Steps
+            for step in self.scale_transforms[scale]:
+                if isinstance(step, (ActNorm, Invertible1x1Conv, FlowCouplingLayer)):
+                    z, log_det = step(z, forward=True)
+                    log_det_sum = log_det_sum + log_det
+            
+            # Factor out
+            if scale < self.num_scales - 1:
+                z_new, z_factor = z.chunk(2, dim=1)
+                zs.append(z_factor)
+                z = z_new
+        
+        zs.append(z)
+        return zs, log_det_sum
+
+    def inverse(self, zs):
+        # Handle input if it's a single tensor (e.g. from torch.randn)
+        if isinstance(zs, torch.Tensor):
+            z_full = zs
+            zs = []
+            
+            b = z_full.shape[0]
+            current_c = 3 # Setup initial channels (assumption fixed to 3 input)
+            current_h = IMG_SIZE
+            current_w = IMG_SIZE
+            
+            # Flatten input z to extract parts
+            z_flat = z_full.view(b, -1)
+            offset = 0
+            
+            for scale in range(self.num_scales):
+                current_c *= 4
+                current_h //= 2
+                current_w //= 2
+                
+                if scale < self.num_scales - 1:
+                    c_split = current_c // 2
+                    num_el = c_split * current_h * current_w
+                    z_part = z_flat[:, offset:offset+num_el].reshape(b, c_split, current_h, current_w)
+                    zs.append(z_part)
+                    offset += num_el
+                    current_c = current_c - c_split
+                else:
+                    z_part = z_flat[:, offset:].reshape(b, current_c, current_h, current_w)
+                    zs.append(z_part)
+        
+        # Now zs is a list of tensors
+        z = zs[-1]
+        
+        for scale in reversed(range(self.num_scales)):
+            # Concatenate if needed
+            if scale < self.num_scales - 1:
+                z_factor = zs[scale]
+                z = torch.cat([z, z_factor], dim=1)
+            
+            # Inverse Flow Steps
+            for step in reversed(self.scale_transforms[scale]):
+                if isinstance(step, (ActNorm, Invertible1x1Conv)):
+                    z = step(z, forward=False)
+                elif isinstance(step, FlowCouplingLayer):
+                    z = step(z, forward=False)
+            
+            # Unsqueeze (Inverse Squeeze)
+            z = self.layers[scale](z, forward=False)
+            
+        return z
     
     def get_loss(self, x):
-        z, log_det = self.forward(x)
-        # NLL = 0.5 * ||z||^2 - log_det + const
-        prior_ll = -0.5 * torch.sum(z.view(z.size(0), -1) ** 2, dim=1) - 0.5 * z.size(1) * z.size(2) * z.size(3) * np.log(2 * np.pi)
+        zs, log_det = self.forward(x)
+        # NLL
+        prior_ll = 0
+        for z in zs:
+            prior_ll += -0.5 * torch.sum(z.view(z.size(0), -1) ** 2, dim=1) - 0.5 * z.numel() / z.size(0) * np.log(2 * np.pi)
+        
         log_likelihood = prior_ll + log_det
-        return -torch.mean(log_likelihood)
+        return -torch.mean(log_likelihood) / (x.shape[1] * x.shape[2] * x.shape[3]) # Normalize by dim
 
 # -----------------------------------------------------------------------------
 # 4. Training & Visualization
@@ -388,13 +561,16 @@ def main():
     save_images(torch.cat(combined_vis, dim=0), "results/diffusion_combined.png", grid_size=8)
     
     # Flow: Normalizing Direction (x -> z)
-    z_out, _ = flow_model(fixed_batch)
-    # Visualizing z is tricky as it's not strictly an image, but we can interpret it as one
-    # to show the "noise-like" structure
-    # Normalize z for vis: centered at 0 with unit var mostly
-    save_images(torch.cat([fixed_batch, z_out], dim=0), "results/flow_normalizing.png", grid_size=8)
+    zs_out, _ = flow_model(fixed_batch)
+    # Visualizing zs is tricky with multi-scale. We will just visualize the first scale factor or nothing.
+    # But to keep it running, we can just skip the "z_out" visualization or create a placeholder
+    # because stitching them back requires inverse squeeze without coupling.
+    # Let's just visualize the reconstruction to verify x -> z -> x
+    x_recon = flow_model.inverse(zs_out)
+    save_images(torch.cat([fixed_batch, x_recon], dim=0), "results/flow_reconstruction.png", grid_size=8)
     
     # Flow: Forward Direction (z -> x)
+    # Generate random z of correct total size
     z_sample = torch.randn(8, 3, IMG_SIZE, IMG_SIZE, device=DEVICE)
     x_gen = flow_model.inverse(z_sample)
     save_images(torch.cat([z_sample, x_gen], dim=0), "results/flow_forward.png", grid_size=8)
