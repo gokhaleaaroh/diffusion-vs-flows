@@ -196,7 +196,7 @@ class Diffusion:
 # 3. Normalizing Flow Model (RealNVP)
 # -----------------------------------------------------------------------------
 class FlowCouplingLayer(nn.Module):
-    def __init__(self, in_channels, mid_channels=64):
+    def __init__(self, in_channels, mid_channels=128):
         super().__init__()
         self.in_channels = in_channels
         # Logic to match torch.chunk(2, dim=1) behavior
