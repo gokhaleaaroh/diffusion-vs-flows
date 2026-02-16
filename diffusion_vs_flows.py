@@ -329,7 +329,7 @@ class Squeeze(nn.Module):
         else:
             # (b, 4c, h/2, w/2) -> (b, c, h, w)
             x = x.view(b, c // 4, 2, 2, h, w)
-            x = x.permute(0, 1, 4, 3, 5, 2).contiguous()
+            x = x.permute(0, 1, 4, 2, 5, 3).contiguous()
             x = x.view(b, c // 4, h * 2, w * 2)
             return x
 
@@ -574,6 +574,12 @@ def main():
     z_sample = torch.randn(8, 3, IMG_SIZE, IMG_SIZE, device=DEVICE)
     x_gen = flow_model.inverse(z_sample)
     save_images(torch.cat([z_sample, x_gen], dim=0), "results/flow_forward.png", grid_size=8)
+
+    # Combined Diffusion: Random Generation
+    # Generate 8 random starting points
+    diff_start_noise = torch.randn(8, 3, IMG_SIZE, IMG_SIZE, device=DEVICE)
+    diff_gen, _ = diffusion.sample((8, 3, IMG_SIZE, IMG_SIZE), start_img=diff_start_noise)
+    save_images(torch.cat([diff_start_noise, diff_gen], dim=0), "results/diffusion_generated.png", grid_size=8)
     
     # ------------------
     # Evaluation (FID)
