@@ -1,0 +1,8 @@
+torch
+torchvision
+datasets
+matplotlib
+numpy
+tqdm
+clean-fid
+scipy
